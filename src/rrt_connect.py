@@ -11,12 +11,18 @@ Configuration space here is the seven arm joint angles. Distance is measured
 in radians across all seven, which treats every joint as equally expensive
 to move. That is a simplification: rotating the base sweeps the whole arm
 through space while rotating the wrist barely moves anything.
+
+Extensions are validated along the whole step, not just at its endpoint. A
+step of 0.3 radians is a chord through configuration space, and the arm can
+sweep through an obstacle between two poses that are each individually
+clear. On a discrete grid a step was one cell with nothing in between; in
+continuous space there is.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
 from random import Random
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -73,8 +79,8 @@ class Tree:
 
     def nearest(self, target: Configuration) -> int:
         """Index of the closest node. Brute force, fine at these sizes."""
-        target_array = np.asarray(target)
-        distances = np.linalg.norm(np.asarray(self.nodes) - target_array, axis=1)
+        distances = np.linalg.norm(
+            np.asarray(self.nodes) - np.asarray(target), axis=1)
         return int(np.argmin(distances))
 
     def path_to_root(self, index: int) -> List[Configuration]:
@@ -90,20 +96,24 @@ class RRTConnect:
     """Bidirectional sampling based planner over the arm's joint space."""
 
     def __init__(self, panda, checker, step_size: float = 0.3,
+                 edge_resolution: float = 0.02,
                  max_iterations: int = 3000, seed: Optional[int] = None):
         """
         Args:
             panda: a Panda instance, for its joint limits.
             checker: a CollisionChecker.
             step_size: how far to move per extension, in radians of joint
-                space distance. Larger is faster but more likely to tunnel
-                through thin obstacles between collision checks.
+                space distance.
+            edge_resolution: spacing, in radians, of the collision checks
+                along each extension. Must be fine enough that the arm
+                cannot pass through the thinnest obstacle between samples.
             max_iterations: give up after this many samples.
             seed: makes a run reproducible.
         """
         self.panda = panda
         self.checker = checker
         self.step_size = step_size
+        self.edge_resolution = edge_resolution
         self.max_iterations = max_iterations
         self.rng = Random(seed)
         self._checks = 0
@@ -120,9 +130,12 @@ class RRTConnect:
                 for lo, hi in zip(self.panda.lower_limits,
                                   self.panda.upper_limits)]
 
-    def _valid(self, configuration: Configuration) -> bool:
+    def _motion_valid(self, origin: Configuration,
+                      target: Configuration) -> bool:
+        """Is the straight line between two configurations collision free?"""
         self._checks += 1
-        return not self.checker.in_collision(configuration)
+        return self.checker.edge_is_valid(origin, target,
+                                          resolution=self.edge_resolution)
 
     def steer(self, origin: Configuration, target: Configuration) -> Configuration:
         """Move from origin toward target by at most step_size."""
@@ -134,15 +147,19 @@ class RRTConnect:
         return list(origin_array + delta * (self.step_size / distance))
 
     def extend(self, tree: Tree, target: Configuration) -> Tuple[ExtendResult, int]:
-        """Take one step from the tree's nearest node toward a target."""
-        nearest_index = tree.nearest(target)
-        candidate = self.steer(tree.nodes[nearest_index], target)
+        """Take one step from the tree's nearest node toward a target.
 
-        if not self._valid(candidate):
+        The whole step is validated, not only the configuration it ends at.
+        """
+        nearest_index = tree.nearest(target)
+        origin = tree.nodes[nearest_index]
+        candidate = self.steer(origin, target)
+
+        if not self._motion_valid(origin, candidate):
             return ExtendResult.TRAPPED, nearest_index
 
         new_index = tree.add(candidate, nearest_index)
-        arrived = np.allclose(candidate, target, atol=1e-6)
+        arrived = bool(np.allclose(candidate, target, atol=1e-6))
         return (ExtendResult.REACHED if arrived else ExtendResult.ADVANCED), new_index
 
     def connect(self, tree: Tree, target: Configuration) -> Tuple[ExtendResult, int]:
