@@ -8,3 +8,4 @@ __pycache__/
 *.gif
 !docs/*.gif
 *.mp4
+data/*.npz

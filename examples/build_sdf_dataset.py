@@ -9,7 +9,7 @@ no amount of pair exclusion fixes the second, because those links genuinely
 can touch. Hence two separate targets rather than one.
 
 Usage:
-    python examples/build_sdf_dataset.py
+    python examples/build_sdf_dataset.py [samples]
 """
 
 import sys
@@ -25,7 +25,7 @@ from src.panda import HOME_CONFIGURATION, Panda
 from src.scene import build
 from src.sdf_data import MAX_QUERY_DISTANCE, SignedDistanceOracle, build_dataset
 
-OUTPUT = Path(__file__).resolve().parent.parent / "data" / "sdf_divided.npz"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 def describe(name: str, values: np.ndarray) -> None:
@@ -40,10 +40,13 @@ def describe(name: str, values: np.ndarray) -> None:
     counts, _ = np.histogram(values, bins=edges)
     for lo, hi, count in zip(edges, edges[1:], counts):
         bar = "#" * int(40 * count / max(counts.max(), 1))
-        print(f"  {lo:>6.2f} to {hi:>5.2f}  {count:>6}  {bar}")
+        print(f"  {lo:>6.2f} to {hi:>5.2f}  {count:>7}  {bar}")
 
 
 def main() -> None:
+    samples = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
+    output = DATA_DIR / f"sdf_divided_{samples}.npz"
+
     with Panda(gui=False) as panda:
         scene = build("divided")
         checker = CollisionChecker(panda, obstacles=scene.bodies)
@@ -55,9 +58,10 @@ def main() -> None:
               f"self {own:.4f} m")
 
         began = time.perf_counter()
-        dataset = build_dataset(panda, oracle, samples=20000, seed=0)
-        print(f"\ngenerated {len(dataset)} samples in "
-              f"{time.perf_counter() - began:.1f} s")
+        dataset = build_dataset(panda, oracle, samples=samples, seed=0)
+        elapsed = time.perf_counter() - began
+        print(f"\ngenerated {len(dataset)} samples in {elapsed:.1f} s "
+              f"({len(dataset) / elapsed:.0f} per second)")
 
         describe("environment distance", dataset.environment_distance)
         describe("self distance", dataset.self_distance)
@@ -65,14 +69,14 @@ def main() -> None:
         binding = (dataset.self_distance < dataset.environment_distance)
         print(f"\nself is the binding term in {binding.mean():.1%} of samples")
 
-        OUTPUT.parent.mkdir(exist_ok=True)
+        DATA_DIR.mkdir(exist_ok=True)
         np.savez_compressed(
-            OUTPUT,
+            output,
             configurations=dataset.configurations,
             environment_distance=dataset.environment_distance,
             self_distance=dataset.self_distance,
         )
-        print(f"\nsaved {OUTPUT} ({OUTPUT.stat().st_size / 1e6:.1f} MB)")
+        print(f"\nsaved {output} ({output.stat().st_size / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
