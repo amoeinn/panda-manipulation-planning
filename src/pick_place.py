@@ -6,18 +6,34 @@ a single query does not: phases must run in order, a failure in one must
 stop the rest rather than produce a partial motion, and the world changes
 partway through.
 
-That last point is the substantive one. Once the gripper closes on the
-block, the block travels with the arm. Until then it is an obstacle to
-avoid; afterward it is part of the moving body and the table below it is
-what must be avoided. A checker that keeps treating the grasped block as a
-fixed obstacle will refuse to plan the transfer, because the arm is holding
-the thing it is trying to stay away from.
+That last point is the substantive one, and getting it half right is worse
+than not doing it at all. An early version removed the grasped block from
+the obstacle list and stopped there, so during the transfer the planner
+neither avoided the block nor accounted for it. The arm cleared the wall
+with 27 mm to spare while the block it was carrying passed 34 mm through
+the wall, and nothing in the verification noticed, because nothing was
+looking at the block. The checker now attaches the block instead: it stops
+being an obstacle and starts being a moving body whose swept volume is
+checked against the world at every configuration.
+
+What counts as a fault changes by phase. Descending to set the block down
+means touching the surface it lands on, which would be a collision during
+the transfer and is the purpose of the placement, so that contact is
+allowed explicitly for the phases where it is intended.
+
+The standoff height is computed in world coordinates. A held block hangs
+about a grasp height below the gripper, so for its underside to clear the
+wall the gripper must reach the wall top plus that grasp height plus a
+margin. Working in offsets relative to landmarks instead invites mixing
+datums: an earlier version measured the wall from the table surface and the
+standoff from the landmark 30 mm above it, and produced a target beyond the
+arm's usable reach.
 
 The phases:
 
   approach   move above the block, gripper open
   descend    straight down to the grasp pose
-  grasp      close the fingers, attach the block
+  grasp      close the fingers, attach the block to the gripper
   lift       straight up, clear of the table
   transfer   plan over the wall to above the place location
   place      straight down to the release pose
@@ -26,7 +42,7 @@ The phases:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pybullet as p
@@ -34,6 +50,8 @@ import pybullet as p
 from .panda import FINGER_CLOSED, FINGER_OPEN, Panda, Pose
 
 Configuration = List[float]
+Transform = Tuple[Tuple[float, float, float],
+                  Tuple[float, float, float, float]]
 
 
 @dataclass
@@ -57,6 +75,9 @@ class PickPlaceResult:
     """The outcome of the whole sequence."""
 
     phases: List[Phase] = field(default_factory=list)
+    block: Optional[int] = None
+    block_start: Optional[Transform] = None
+    grasp_relative: Optional[Transform] = None
 
     @property
     def succeeded(self) -> bool:
@@ -73,51 +94,16 @@ class PickPlaceResult:
         return sum(len(p.path) for p in self.phases)
 
 
-class GraspedObject:
-    """Tracks a block that is rigidly held by the gripper.
+def place_held_body(panda: Panda, body: int, relative: Transform,
+                    link: int = 11) -> None:
+    """Move a held body to match the arm's current configuration.
 
-    PyBullet has constraints for this, but for planning we only need the
-    block to move with the arm and to stop being an obstacle, which a fixed
-    constraint plus a change to the checker's obstacle list achieves.
+    Replay teleports joints with resetJointState, which bypasses the physics
+    constraint solver, so a held object has to be positioned explicitly.
     """
-
-    def __init__(self, panda: Panda, body: int, end_effector_link: int = 11):
-        self.panda = panda
-        self.body = body
-        self.link = end_effector_link
-        self.constraint: Optional[int] = None
-
-    def attach(self) -> None:
-        """Rigidly fix the block to the gripper at its current relative pose."""
-        if self.constraint is not None:
-            return
-        link_state = p.getLinkState(self.panda.robot, self.link,
-                                    computeForwardKinematics=True)
-        block_position, block_orientation = p.getBasePositionAndOrientation(
-            self.body)
-
-        inverse_position, inverse_orientation = p.invertTransform(
-            link_state[4], link_state[5])
-        relative_position, relative_orientation = p.multiplyTransforms(
-            inverse_position, inverse_orientation,
-            block_position, block_orientation)
-
-        self.constraint = p.createConstraint(
-            parentBodyUniqueId=self.panda.robot,
-            parentLinkIndex=self.link,
-            childBodyUniqueId=self.body,
-            childLinkIndex=-1,
-            jointType=p.JOINT_FIXED,
-            jointAxis=(0, 0, 0),
-            parentFramePosition=relative_position,
-            childFramePosition=(0, 0, 0),
-            parentFrameOrientation=relative_orientation,
-        )
-
-    def detach(self) -> None:
-        if self.constraint is not None:
-            p.removeConstraint(self.constraint)
-            self.constraint = None
+    state = p.getLinkState(panda.robot, link, computeForwardKinematics=True)
+    position, orientation = p.multiplyTransforms(state[4], state[5], *relative)
+    p.resetBasePositionAndOrientation(body, position, orientation)
 
 
 def straight_line(start: Configuration, end: Configuration,
@@ -137,70 +123,77 @@ class PickPlace:
     def __init__(self, panda: Panda, checker, scene,
                  plan: Callable[[Configuration, Configuration],
                                 Optional[List[Configuration]]],
-                 approach_height: float = 0.14,
-                 grasp_height: float = 0.055):
+                 standoff_z: Optional[float] = None,
+                 grasp_height: float = 0.055,
+                 wall_margin: float = 0.055):
         """
         Args:
             panda: a Panda instance.
-            checker: a CollisionChecker whose obstacle list can be changed
-                when the block is grasped.
+            checker: a CollisionChecker supporting attach and detach.
             scene: a Scene with pick and place landmarks and a block body.
             plan: a function taking two configurations and returning a path
                 or None. Lets the caller choose planner and post processing.
-            approach_height: metres above the landmark for the standoff
-                pose, chosen to clear the wall.
-            grasp_height: metres above the landmark for the grasp pose.
+            standoff_z: world height, in metres, for the gripper during the
+                transfer. Derived from the wall when not given, since a
+                standoff below the wall makes the transfer impossible for a
+                carried block no matter how well it is planned.
+            grasp_height: metres above the landmark for the grasp pose. Also
+                how far the block hangs below the gripper once held.
+            wall_margin: extra clearance above the wall top, in metres.
         """
         self.panda = panda
         self.checker = checker
         self.scene = scene
         self.plan = plan
-        self.approach_height = approach_height
         self.grasp_height = grasp_height
 
-        # The block is the third body in the divided table scene: table,
-        # wall, block, place marker.
-        self.block = scene.bodies[2]
-        self.grasped = GraspedObject(panda, self.block)
+        # The divided table scene lists table, wall, block, place marker.
+        self.table, self.wall, self.block, self.marker = scene.bodies
 
-    def _pose_above(self, landmark: str, height: float) -> Pose:
-        x, y, z = self.scene.landmarks[landmark]
+        if standoff_z is None:
+            wall_top = scene.landmarks["wall_top"][2]
+            standoff_z = wall_top + grasp_height + wall_margin
+        self.standoff_z = standoff_z
+
+    def _pose_at(self, landmark: str, world_z: float) -> Pose:
+        """A gripper pose above a landmark, at an absolute world height."""
+        x, y, _ = self.scene.landmarks[landmark]
         home = self.panda.forward_kinematics()
-        return Pose(position=(x, y, z + height), orientation=home.orientation)
+        return Pose(position=(x, y, world_z), orientation=home.orientation)
 
-    def _solve(self, landmark: str, height: float,
+    def _grasp_z(self, landmark: str) -> float:
+        return self.scene.landmarks[landmark][2] + self.grasp_height
+
+    def _solve(self, landmark: str, world_z: float,
                seed: Optional[Configuration] = None
                ) -> Tuple[Optional[Configuration], str]:
         """IK for a pose above a landmark, verified before it is returned."""
         result = self.panda.inverse_kinematics(
-            self._pose_above(landmark, height), seed_configuration=seed)
+            self._pose_at(landmark, world_z), seed_configuration=seed)
         if not result.solved:
-            return None, f"no IK solution, error {result.position_error:.4f} m"
+            return None, (f"no IK solution at z={world_z:.3f}, "
+                          f"error {result.position_error:.4f} m")
         if not self.checker.is_valid(result.configuration):
-            return None, "IK solution is in collision"
+            return None, (f"IK solution at z={world_z:.3f} invalid: "
+                          f"{self.checker.check(result.configuration)}")
         return result.configuration, ""
-
-    def _set_block_as_obstacle(self, is_obstacle: bool) -> None:
-        """Add or remove the block from what the checker avoids."""
-        if is_obstacle and self.block not in self.checker.obstacles:
-            self.checker.obstacles.append(self.block)
-        elif not is_obstacle and self.block in self.checker.obstacles:
-            self.checker.obstacles.remove(self.block)
 
     def run(self, home: Configuration) -> PickPlaceResult:
         """Execute the full sequence from a home configuration."""
-        result = PickPlaceResult()
+        result = PickPlaceResult(
+            block=self.block,
+            block_start=p.getBasePositionAndOrientation(self.block),
+        )
 
         def fail(name: str, reason: str) -> PickPlaceResult:
             result.phases.append(Phase(name=name, failure=reason))
             return result
 
-        # The block is an obstacle until it is grasped.
-        self._set_block_as_obstacle(True)
+        self.checker.detach(as_obstacle=True)
         self.panda.set_configuration(home)
         self.panda.set_gripper(FINGER_OPEN)
 
-        pick_above, error = self._solve("pick", self.approach_height)
+        pick_above, error = self._solve("pick", self.standoff_z)
         if pick_above is None:
             return fail("approach", error)
 
@@ -210,10 +203,11 @@ class PickPlace:
         result.phases.append(Phase("approach", path, gripper=FINGER_OPEN,
                                    planner="planned"))
 
-        # Descending onto the block means touching it, so it stops being an
-        # obstacle for this phase.
-        self._set_block_as_obstacle(False)
-        pick_at, error = self._solve("pick", self.grasp_height,
+        # Descending onto the block means touching it, so it is neither an
+        # obstacle nor attached during this phase.
+        if self.block in self.checker.obstacles:
+            self.checker.obstacles.remove(self.block)
+        pick_at, error = self._solve("pick", self._grasp_z("pick"),
                                      seed=pick_above)
         if pick_at is None:
             return fail("descend", error)
@@ -222,7 +216,8 @@ class PickPlace:
 
         self.panda.set_configuration(pick_at)
         self.panda.set_gripper(FINGER_CLOSED)
-        self.grasped.attach()
+        self.checker.attach(self.block)
+        result.grasp_relative = self.checker.attached.relative
         result.phases.append(Phase("grasp", [pick_at], gripper=FINGER_CLOSED,
                                    attached=True, planner="gripper only"))
 
@@ -230,19 +225,23 @@ class PickPlace:
                                    gripper=FINGER_CLOSED, attached=True,
                                    planner="straight line"))
 
-        place_above, error = self._solve("place", self.approach_height,
+        place_above, error = self._solve("place", self.standoff_z,
                                          seed=pick_above)
         if place_above is None:
             return fail("transfer", error)
 
         transfer = self.plan(pick_above, place_above)
         if transfer is None:
-            return fail("transfer", "no path over the wall")
+            return fail("transfer", "no path over the wall carrying the block")
         result.phases.append(Phase("transfer", transfer,
                                    gripper=FINGER_CLOSED, attached=True,
                                    planner="planned"))
 
-        place_at, error = self._solve("place", self.grasp_height,
+        # Setting the block down means touching what it lands on. The place
+        # marker and the table are intended contacts from here on.
+        self.checker.allow_contact_with(self.marker, self.table)
+
+        place_at, error = self._solve("place", self._grasp_z("place"),
                                       seed=place_above)
         if place_at is None:
             return fail("place", error)
@@ -252,7 +251,8 @@ class PickPlace:
                                    planner="straight line"))
 
         self.panda.set_configuration(place_at)
-        self.grasped.detach()
+        place_held_body(self.panda, self.block, self.checker.attached.relative)
+        self.checker.detach(as_obstacle=False)
         self.panda.set_gripper(FINGER_OPEN)
         result.phases.append(Phase("release", [place_at], gripper=FINGER_OPEN,
                                    planner="gripper only"))
@@ -262,5 +262,4 @@ class PickPlace:
                                    gripper=FINGER_OPEN,
                                    planner="straight line"))
 
-        self._set_block_as_obstacle(True)
         return result

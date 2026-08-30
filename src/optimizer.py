@@ -7,7 +7,7 @@ optimizer can do better because it has a gradient, and pushing every
 waypoint downhill against a cost that combines proximity and smoothness
 improves the whole trajectory at once rather than one segment at a time.
 
-Four decisions shape the cost.
+Four terms shape the cost.
 
 Endpoints are held fixed. The start is where the arm is and the goal is
 where it must arrive, so only interior waypoints are free variables.
@@ -21,6 +21,15 @@ Smoothness is the squared second difference along the trajectory, which
 penalizes waypoint to waypoint reversals. This term comes from CHOMP and is
 still the right objective; it was CHOMP's hand built obstacle field that
 dated, not this.
+
+Deviation from the seed path is penalized lightly. Without it the first two
+terms are satisfied by trajectories that wander: clearance points the arm
+away from every surface, smoothness prefers a wide gentle arc to a tight
+one, and neither cares where the planner's route went. Measured on the
+transfer motion, the unanchored optimizer carried the gripper 38 mm past
+the goal in y and 273 mm above it before coming back down. Anchoring keeps
+the clearance gain while holding the trajectory near the route that was
+actually planned.
 
 The learned field is a cost, not an authority. Its boundary sign agreement
 is about 76 percent, so it will occasionally be wrong about whether a
@@ -96,6 +105,12 @@ def clearance_cost(distances: torch.Tensor, margin: float) -> torch.Tensor:
     return (violation ** 2).sum()
 
 
+def deviation_cost(trajectory: torch.Tensor,
+                   reference: torch.Tensor) -> torch.Tensor:
+    """Squared joint space distance from the seed path."""
+    return ((trajectory - reference) ** 2).sum()
+
+
 class TrajectoryOptimizer:
     """Pushes a trajectory downhill against clearance and smoothness."""
 
@@ -106,6 +121,7 @@ class TrajectoryOptimizer:
                  environment_weight: float = 40.0,
                  self_weight: float = 40.0,
                  smoothness_weight: float = 1.0,
+                 deviation_weight: float = 0.05,
                  learning_rate: float = 0.01):
         """
         Args:
@@ -120,7 +136,10 @@ class TrajectoryOptimizer:
                 larger margin would penalize every configuration equally
                 and carry no information.
             environment_weight, self_weight, smoothness_weight: relative
-                importance of the three terms.
+                importance of the three main terms.
+            deviation_weight: how strongly to anchor the result to the seed
+                path. Small: enough to stop the trajectory wandering, not
+                enough to prevent it moving away from obstacles.
             learning_rate: Adam step size, in radians.
         """
         self.model = model
@@ -136,18 +155,26 @@ class TrajectoryOptimizer:
         self.environment_weight = environment_weight
         self.self_weight = self_weight
         self.smoothness_weight = smoothness_weight
+        self.deviation_weight = deviation_weight
         self.learning_rate = learning_rate
 
-    def cost(self, trajectory: torch.Tensor) -> torch.Tensor:
+    def cost(self, trajectory: torch.Tensor,
+             reference: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Total cost of a trajectory, as the optimizer sees it."""
         distances = self.model.distances(trajectory)
         environment = clearance_cost(distances[:, ENVIRONMENT],
                                      self.environment_margin)
         own = clearance_cost(distances[:, SELF], self.self_margin)
         smooth = smoothness_cost(trajectory)
-        return (self.environment_weight * environment
-                + self.self_weight * own
-                + self.smoothness_weight * smooth)
+
+        total = (self.environment_weight * environment
+                 + self.self_weight * own
+                 + self.smoothness_weight * smooth)
+
+        if reference is not None and self.deviation_weight > 0:
+            total = total + self.deviation_weight * deviation_cost(
+                trajectory, reference)
+        return total
 
     def optimize(self, path: Sequence[Configuration], waypoints: int = 40,
                  iterations: int = 300) -> OptimizeResult:
@@ -159,8 +186,9 @@ class TrajectoryOptimizer:
             iterations: gradient steps to take.
         """
         initial = resample(path, waypoints)
-        start = torch.tensor(initial[0], dtype=torch.float32)
-        goal = torch.tensor(initial[-1], dtype=torch.float32)
+        reference = torch.tensor(initial, dtype=torch.float32)
+        start = reference[0]
+        goal = reference[-1]
 
         interior = torch.tensor(initial[1:-1], dtype=torch.float32,
                                 requires_grad=True)
@@ -171,7 +199,7 @@ class TrajectoryOptimizer:
             optimizer.zero_grad()
             trajectory = torch.cat([start.unsqueeze(0), interior,
                                     goal.unsqueeze(0)], dim=0)
-            loss = self.cost(trajectory)
+            loss = self.cost(trajectory, reference)
             loss.backward()
             optimizer.step()
 

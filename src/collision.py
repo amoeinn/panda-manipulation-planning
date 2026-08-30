@@ -19,6 +19,18 @@ calibration run with the gripper open records them as separable and a later
 closed gripper then reports a permanent self collision. They are also
 mechanically mirrored and cannot be driven into each other, so the pair
 carries no information at any width.
+
+A grasped object is neither an obstacle nor irrelevant. Once the gripper
+closes on a block, the block travels with the arm: it must stop being
+something to avoid and start being something whose swept volume is checked
+against the world. Attaching it here rather than merely removing it from
+the obstacle list is what makes the planner route a carried object over a
+wall instead of dragging it through one.
+
+Some contact is intended. A grasp means the fingers touch the block, and
+setting the block down means the block touches the surface it lands on.
+Both are expressed as allowances on the attached object rather than by
+skipping the check, so anything else touching it is still caught.
 """
 
 from dataclasses import dataclass, field
@@ -37,6 +49,30 @@ BASE_LINK = -1
 # property of the arm's configuration, so it is never a collision.
 FINGER_PAIR: LinkPair = (9, 10)
 
+# Frame the gripper holds objects relative to.
+END_EFFECTOR_LINK = 11
+
+# Hand and fingers: the links a grasped object is expected to touch.
+GRIPPER_LINKS = (8, 9, 10, 11)
+
+Transform = Tuple[Tuple[float, float, float],
+                  Tuple[float, float, float, float]]
+
+
+@dataclass
+class AttachedObject:
+    """A body rigidly held by the gripper.
+
+    Stores the pose of the body relative to the end effector at the moment
+    it was grasped, so its world pose can be recomputed for any arm
+    configuration without stepping physics.
+    """
+
+    body: int
+    relative: Transform
+    allowed_links: Set[int] = field(default_factory=set)
+    allowed_bodies: Set[int] = field(default_factory=set)
+
 
 @dataclass
 class CollisionReport:
@@ -44,10 +80,11 @@ class CollisionReport:
 
     self_pairs: List[LinkPair] = field(default_factory=list)
     environment: Dict[int, List[int]] = field(default_factory=dict)
+    attached: Dict[int, List[int]] = field(default_factory=dict)
 
     @property
     def free(self) -> bool:
-        return not self.self_pairs and not self.environment
+        return not self.self_pairs and not self.environment and not self.attached
 
     def __repr__(self) -> str:
         if self.free:
@@ -58,6 +95,8 @@ class CollisionReport:
         if self.environment:
             links = sorted({l for ls in self.environment.values() for l in ls})
             parts.append(f"environment links={links}")
+        if self.attached:
+            parts.append(f"held object hits bodies={sorted(self.attached)}")
         return f"CollisionReport({', '.join(parts)})"
 
 
@@ -83,6 +122,7 @@ class CollisionChecker:
         self.margin = margin
         self.obstacles = [panda.plane] + list(obstacles or [])
         self.num_links = p.getNumJoints(self.robot)
+        self.attached: Optional[AttachedObject] = None
 
         # Every link pair, base included, that is worth testing at all.
         self._all_pairs = [
@@ -98,6 +138,93 @@ class CollisionChecker:
 
         self._pairs = [pair for pair in self._all_pairs
                        if pair not in self.ignored_self_pairs]
+
+    # ------------------------------------------------------------ attachment
+
+    def attach(self, body: int, allowed_links: Optional[Iterable[int]] = None,
+               allowed_bodies: Optional[Iterable[int]] = None) -> None:
+        """Treat a body as held by the gripper from now on.
+
+        The body stops being an obstacle and starts being checked against
+        the rest of the world at every configuration. Its pose relative to
+        the end effector is recorded now and reapplied later.
+
+        Args:
+            body: the body id to attach.
+            allowed_links: robot links permitted to touch it, the hand and
+                fingers by default, since a grasp is a contact.
+            allowed_bodies: world bodies permitted to touch it, for
+                intended contacts such as the surface it will be set on.
+        """
+        link_state = p.getLinkState(self.robot, END_EFFECTOR_LINK,
+                                    computeForwardKinematics=True)
+        body_position, body_orientation = p.getBasePositionAndOrientation(body)
+        inverse = p.invertTransform(link_state[4], link_state[5])
+        relative = p.multiplyTransforms(inverse[0], inverse[1],
+                                        body_position, body_orientation)
+
+        self.attached = AttachedObject(
+            body=body,
+            relative=relative,
+            allowed_links=set(allowed_links if allowed_links is not None
+                              else GRIPPER_LINKS),
+            allowed_bodies=set(allowed_bodies or ()),
+        )
+        if body in self.obstacles:
+            self.obstacles.remove(body)
+
+    def allow_contact_with(self, *bodies: int) -> None:
+        """Permit the held object to touch these bodies from now on.
+
+        Used when a phase changes what counts as intended: descending to set
+        a block down means touching the surface below it, which is a fault
+        during the transfer and the point of the placement.
+        """
+        if self.attached is not None:
+            self.attached.allowed_bodies.update(bodies)
+
+    def detach(self, as_obstacle: bool = True) -> None:
+        """Release the held body, optionally restoring it as an obstacle."""
+        if self.attached is None:
+            return
+        body = self.attached.body
+        self.attached = None
+        if as_obstacle and body not in self.obstacles:
+            self.obstacles.append(body)
+
+    def _place_attached(self) -> None:
+        """Move the held body to match the current arm configuration."""
+        if self.attached is None:
+            return
+        link_state = p.getLinkState(self.robot, END_EFFECTOR_LINK,
+                                    computeForwardKinematics=True)
+        position, orientation = p.multiplyTransforms(
+            link_state[4], link_state[5], *self.attached.relative)
+        p.resetBasePositionAndOrientation(self.attached.body,
+                                          position, orientation)
+
+    def _attached_hits(self) -> Dict[int, List[int]]:
+        """Bodies the held object touches, at the current configuration."""
+        if self.attached is None:
+            return {}
+        self._place_attached()
+
+        hits: Dict[int, List[int]] = {}
+        for body in self.obstacles:
+            if body in self.attached.allowed_bodies:
+                continue
+            if p.getClosestPoints(self.attached.body, body, self.margin):
+                hits[body] = [-1]
+
+        touching_robot = [
+            contact[3]
+            for contact in p.getClosestPoints(self.attached.body, self.robot,
+                                              self.margin)
+            if contact[3] not in self.attached.allowed_links
+        ]
+        if touching_robot:
+            hits[self.robot] = sorted(set(touching_robot))
+        return hits
 
     # ----------------------------------------------------------- calibration
 
@@ -135,7 +262,6 @@ class CollisionChecker:
                 for contact in p.getClosestPoints(self.robot, body, self.margin)
             }
 
-            # Intersect: only pairs touching in every configuration survive.
             candidate_self = (touching_self if candidate_self is None
                               else candidate_self & touching_self)
             candidate_env = (touching_env if candidate_env is None
@@ -182,9 +308,11 @@ class CollisionChecker:
             if links:
                 environment[body] = links
 
+        attached = self._attached_hits()
+
         if saved is not None:
             self.panda.set_configuration(saved)
-        return CollisionReport(self_pairs, environment)
+        return CollisionReport(self_pairs, environment, attached)
 
     def in_collision(self, configuration: Optional[Configuration] = None) -> bool:
         """Is this configuration in collision? Returns on the first hit.
@@ -211,6 +339,9 @@ class CollisionChecker:
                                       linkIndexA=a, linkIndexB=b):
                     hit = True
                     break
+
+        if not hit and self.attached is not None:
+            hit = bool(self._attached_hits())
 
         if saved is not None:
             self.panda.set_configuration(saved)
