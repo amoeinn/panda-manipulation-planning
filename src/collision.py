@@ -12,19 +12,30 @@ model's internal structure, they are found by measurement: sample the arm
 across many configurations, and any pair in contact in every single one is
 structural and gets disabled. This is the approach MoveIt's setup assistant
 takes, and it adapts automatically if the model changes.
+
+The two fingers are excluded outright rather than by calibration. Their
+separation is a commanded width, not a consequence of the arm's pose, so a
+calibration run with the gripper open records them as separable and a later
+closed gripper then reports a permanent self collision. They are also
+mechanically mirrored and cannot be driven into each other, so the pair
+carries no information at any width.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pybullet as p
 
-Configuration = Sequence[float]
+Configuration = List[float]
 LinkPair = Tuple[int, int]
 
 # Link index of the robot base. PyBullet numbers it separately from joints.
 BASE_LINK = -1
+
+# The two prismatic finger links. Their separation is commanded, not a
+# property of the arm's configuration, so it is never a collision.
+FINGER_PAIR: LinkPair = (9, 10)
 
 
 @dataclass
@@ -78,6 +89,7 @@ class CollisionChecker:
             (a, b)
             for a in range(BASE_LINK, self.num_links)
             for b in range(a + 1, self.num_links)
+            if (a, b) != FINGER_PAIR
         ]
 
         self.ignored_self_pairs: Set[LinkPair] = set()
