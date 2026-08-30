@@ -2,9 +2,8 @@
 
 The properties asserted here are the ones that were actually violated at
 some point while building this, plus the invariants that make the rest
-trustworthy. Every one of the regression tests below corresponds to a bug
-that shipped briefly and was caught by measurement rather than by reading
-the code.
+trustworthy. Every regression test below corresponds to a bug that shipped
+briefly and was caught by measurement rather than by reading the code.
 """
 
 import sys
@@ -13,17 +12,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import pybullet as pb
 import pytest
+import torch
 
 from src.collision import CollisionChecker
 from src.optimizer import resample, smoothness_cost
 from src.panda import HOME_CONFIGURATION, Panda, Pose
+from src.pick_place import PickPlace, place_held_body, straight_line
 from src.rrt_connect import RRTConnect
 from src.scene import build
 from src.sdf_data import SignedDistanceOracle
 from src.shortcut import path_length, shortcut
-
-import torch
 
 
 @pytest.fixture(scope="module")
@@ -125,6 +125,16 @@ class TestCollisionChecker:
         _, _, checker, _ = world
         assert checker.ignored_environment
 
+    def test_closed_gripper_is_not_a_self_collision(self, world):
+        """Regression: calibration runs with the gripper open, so the finger
+        pair is recorded as separable. Closing the gripper put both fingers
+        at the same position and every validity check failed afterward."""
+        panda, _, checker, _ = world
+        panda.set_gripper(0.0)
+        valid = checker.is_valid(HOME_CONFIGURATION)
+        panda.set_gripper(0.04)
+        assert valid
+
     def test_edge_checking_catches_what_endpoints_miss(self, world):
         """Two valid configurations can have an invalid motion between them.
 
@@ -145,6 +155,144 @@ class TestCollisionChecker:
                 found = True
                 break
         assert found, "expected some valid pair with a blocked motion"
+
+
+class TestAttachedObject:
+    """Regression tests for the bug that let a carried block pass through
+    the wall while the motion verified as collision free."""
+
+    def test_attached_object_is_checked_against_the_world(self, world):
+        """An attached body must be able to invalidate a configuration.
+
+        This is the property that was missing entirely: grasping removed
+        the block from the obstacle list and put nothing in its place, so
+        nothing looked at it again.
+        """
+        panda, scene, checker, _ = world
+        _, wall, block, _ = scene.bodies
+
+        # A pose that puts the gripper low, beside the wall, where a held
+        # block would intersect it.
+        home_pose = panda.forward_kinematics(HOME_CONFIGURATION)
+        x, y, z = scene.landmarks["pick"]
+        low = panda.inverse_kinematics(
+            Pose(position=(x, y, z + 0.055),
+                 orientation=home_pose.orientation))
+        assert low.solved
+
+        checker.obstacles.remove(block)
+        panda.set_configuration(low.configuration)
+        checker.attach(block)
+
+        # Sweep toward the wall until the held block hits something.
+        blocked = False
+        for offset in np.linspace(0.0, 0.44, 25):
+            target = panda.inverse_kinematics(
+                Pose(position=(x, y + offset, z + 0.055),
+                     orientation=home_pose.orientation),
+                seed_configuration=low.configuration)
+            if not target.solved:
+                continue
+            if checker.in_collision(target.configuration):
+                blocked = True
+                break
+
+        checker.detach(as_obstacle=True)
+        assert blocked, "a held block never invalidated any configuration"
+
+    def test_detach_restores_the_obstacle(self, world):
+        panda, scene, checker, _ = world
+        _, _, block, _ = scene.bodies
+        panda.set_configuration(HOME_CONFIGURATION)
+        checker.attach(block)
+        assert block not in checker.obstacles
+        checker.detach(as_obstacle=True)
+        assert block in checker.obstacles
+        assert checker.attached is None
+
+    def test_allowed_bodies_permit_intended_contact(self, world):
+        """Setting a block down means touching what it lands on."""
+        panda, scene, checker, _ = world
+        table, _, block, _ = scene.bodies
+        home_pose = panda.forward_kinematics(HOME_CONFIGURATION)
+        x, y, z = scene.landmarks["place"]
+
+        down = panda.inverse_kinematics(
+            Pose(position=(x, y, z + 0.055),
+                 orientation=home_pose.orientation))
+        assert down.solved
+
+        checker.obstacles.remove(block)
+        panda.set_configuration(down.configuration)
+        checker.attach(block)
+        checker.allow_contact_with(table, *scene.bodies[3:])
+        permitted = checker.is_valid(down.configuration)
+        checker.detach(as_obstacle=True)
+        assert permitted
+
+    def test_held_block_pose_follows_the_gripper(self, world):
+        """The block's pose relative to the gripper must not change.
+
+        Not that it translates the same distance as the gripper: the block
+        is held at an offset, so any rotation of the end effector swings it
+        through an arc and it travels further than the gripper origin does.
+        Rigid attachment is about the relative transform, not the distance.
+
+        Tolerance is 1e-6 rather than tighter. Recovering the relative pose
+        means a quaternion inversion and two multiplications, and PyBullet
+        works in single precision, so agreement to about eight significant
+        figures is the most that survives the round trip.
+        """
+        panda, scene, checker, _ = world
+        _, _, block, _ = scene.bodies
+        panda.set_configuration(HOME_CONFIGURATION)
+        checker.attach(block)
+        relative = checker.attached.relative
+
+        def relative_pose():
+            place_held_body(panda, block, relative)
+            state = pb.getLinkState(panda.robot, 11,
+                                    computeForwardKinematics=True)
+            inverse = pb.invertTransform(state[4], state[5])
+            block_pose = pb.getBasePositionAndOrientation(block)
+            return pb.multiplyTransforms(inverse[0], inverse[1], *block_pose)
+
+        before_position, before_orientation = relative_pose()
+        first = panda.forward_kinematics()
+
+        panda.set_configuration([0.3, -0.5, 0.1, -2.0, 0.0, 1.6, 0.7])
+        after_position, after_orientation = relative_pose()
+        second = panda.forward_kinematics()
+
+        checker.detach(as_obstacle=True)
+
+        moved = np.linalg.norm(np.array(second.position)
+                               - np.array(first.position))
+        assert moved > 0.05, "the gripper needs to actually move"
+        assert np.allclose(before_position, after_position, atol=1e-6)
+        assert np.allclose(before_orientation, after_orientation, atol=1e-6)
+
+
+class TestPickPlaceGeometry:
+    def test_standoff_clears_the_wall_for_a_carried_block(self, world):
+        """Regression: a standoff 0.14 m above the landmark put a held block
+        below the top of a 0.25 m wall, so no plan could get it across."""
+        panda, scene, checker, _ = world
+        task = PickPlace(panda, checker, scene, plan=lambda a, b: None)
+        wall_top = scene.landmarks["wall_top"][2]
+        block_bottom = task.standoff_z - task.grasp_height - 0.03
+        assert block_bottom > wall_top
+
+    def test_standoff_is_reachable(self, world):
+        panda, scene, checker, _ = world
+        task = PickPlace(panda, checker, scene, plan=lambda a, b: None)
+        home_pose = panda.forward_kinematics(HOME_CONFIGURATION)
+        for label in ("pick", "place"):
+            x, y, _ = scene.landmarks[label]
+            result = panda.inverse_kinematics(
+                Pose(position=(x, y, task.standoff_z),
+                     orientation=home_pose.orientation))
+            assert result.solved, f"standoff unreachable above {label}"
 
 
 class TestSignedDistanceOracle:
@@ -282,3 +430,11 @@ class TestOptimizerPieces:
         jagged = line.clone()
         jagged[10] += 0.5
         assert float(smoothness_cost(jagged)) > float(smoothness_cost(line))
+
+    def test_straight_line_hits_both_ends(self):
+        a = [0.0] * 7
+        b = [0.4] * 7
+        path = straight_line(a, b, waypoints=9)
+        assert len(path) == 9
+        assert np.allclose(path[0], a)
+        assert np.allclose(path[-1], b)
