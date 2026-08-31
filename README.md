@@ -14,9 +14,7 @@ The arm picks a block from one side of a divided table and places it on the othe
 
 **A learned signed distance field** predicts clearance from a joint configuration: distance to the nearest obstacle and the smallest separation between arm links that can touch. Two outputs rather than one, for reasons under Results. It is differentiable, which is the point: an optimizer needs to know which way to move, and a collision checker only answers yes or no.
 
-**Gradient-based trajectory optimization** pushes every interior waypoint downhill against clearance, smoothness and deviation from the seed path, using gradients from the learned field.
-
-CHOMP was in the original plan and was dropped. It dates from 2009 and appears in current work as a baseline citation; its smoothness objective is still correct and is used here, but its hand-built obstacle field is what a learned field replaces.
+**Gradient-based trajectory optimization** pushes every interior waypoint downhill against clearance, smoothness and deviation from the seed path, using gradients from the learned field. The smoothness term is CHOMP's, squared acceleration along the trajectory; what a learned field replaces is CHOMP's hand-built obstacle cost.
 
 ## Results
 
