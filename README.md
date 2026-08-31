@@ -179,3 +179,8 @@ tests/
   test_planning.py            thirty tests
 ```
 
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+This covers the code in this repository. The Franka Panda URDF and meshes are Franka Emika's, redistributed with PyBullet under their own terms.
