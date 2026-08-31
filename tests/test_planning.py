@@ -438,3 +438,49 @@ class TestOptimizerPieces:
         assert len(path) == 9
         assert np.allclose(path[0], a)
         assert np.allclose(path[-1], b)
+
+class TestReproducibility:
+    """A fixed seed on a fixed query must give a fixed answer.
+
+    Regression: the README figure and the optimizer demo reported 3.09 and
+    2.59 rad for the same query with the same seeds, because the figure was
+    built after a pick and place sequence had moved the block, emptied the
+    obstacle list and parked the arm somewhere that seeded IK differently.
+    Nothing in the suite compared two entry points against each other, so
+    the drift went unnoticed until the numbers were read side by side.
+    """
+
+    def test_query_endpoints_are_stable(self, world):
+        """IK for the landmarks must not depend on where the arm happens
+        to be, beyond the tolerance a redundant arm allows."""
+        panda, scene, checker, _ = world
+        home_pose = panda.forward_kinematics(HOME_CONFIGURATION)
+
+        def endpoints():
+            out = []
+            for label in ("pick", "place"):
+                x, y, z = scene.landmarks[label]
+                out.append(panda.inverse_kinematics(
+                    Pose(position=(x, y, z + 0.10),
+                         orientation=home_pose.orientation),
+                    seed_configuration=HOME_CONFIGURATION).configuration)
+            return out
+
+        panda.set_configuration(HOME_CONFIGURATION)
+        first = endpoints()
+        panda.set_configuration([0.4, -0.3, 0.2, -1.7, 0.1, 1.9, 0.6])
+        second = endpoints()
+
+        for a, b in zip(first, second):
+            assert np.allclose(a, b, atol=1e-6)
+
+    def test_path_length_is_stable_across_runs(self, world, query):
+        """The same seed on the same query gives the same path length."""
+        panda, _, checker, _ = world
+        start, goal = query
+        lengths = []
+        for _ in range(2):
+            panda.set_configuration(HOME_CONFIGURATION)
+            result = RRTConnect(panda, checker, seed=1).plan(start, goal)
+            lengths.append(path_length(result.path))
+        assert abs(lengths[0] - lengths[1]) < 1e-9
