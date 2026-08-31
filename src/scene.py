@@ -7,10 +7,17 @@ direct route between two sides.
 
 Bodies are created from primitive shapes rather than loaded from URDFs, so
 a scene is defined in one place and its dimensions are visible in the code.
+
+The block is sized against the gripper rather than picked for convenience.
+The Panda's jaws open to 71.7 mm and close past each other, and the
+fingertips sit about 11 mm below the grasp target frame, so a 40 mm cube
+leaves roughly 16 mm of clearance per side and can be straddled properly. A
+60 mm cube fits between the jaws on paper but leaves 6 mm a side, which is
+too tight to be robust.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pybullet as p
 
@@ -21,6 +28,9 @@ TABLE_COLOR = (0.72, 0.68, 0.62, 1.0)
 WALL_COLOR = (0.60, 0.62, 0.66, 1.0)
 OBJECT_COLOR = (0.80, 0.42, 0.30, 1.0)
 TARGET_COLOR = (0.30, 0.55, 0.45, 1.0)
+
+# Half extent of the graspable block, in metres.
+BLOCK_HALF = 0.02
 
 
 @dataclass
@@ -87,17 +97,18 @@ def divided_table_scene(height: float = 0.20,
                 position=(0.55, 0.0, surface + wall_height / 2),
                 color=WALL_COLOR)
 
-    pick = (0.55, -0.22, surface + 0.03)
-    place = (0.55, 0.22, surface + 0.03)
+    # The block rests on the table, so its centre sits one half extent up.
+    pick = (0.55, -0.22, surface + BLOCK_HALF)
+    place = (0.55, 0.22, surface + BLOCK_HALF)
 
-    pick_marker = _box(half_extents=(0.03, 0.03, 0.03),
-                       position=pick, color=OBJECT_COLOR)
+    block = _box(half_extents=(BLOCK_HALF,) * 3,
+                 position=pick, color=OBJECT_COLOR)
     place_marker = _box(half_extents=(0.04, 0.04, 0.002),
                         position=(place[0], place[1], surface),
                         color=TARGET_COLOR)
 
     return Scene(
-        bodies=[top, wall, pick_marker, place_marker],
+        bodies=[top, wall, block, place_marker],
         landmarks={
             "table_surface": (0.55, 0.0, surface),
             "pick": pick,
@@ -105,6 +116,7 @@ def divided_table_scene(height: float = 0.20,
             "wall_top": (0.55, 0.0, surface + wall_height),
         },
     )
+
 
 SCENES = {
     "empty": empty_scene,

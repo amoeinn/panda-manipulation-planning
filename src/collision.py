@@ -204,7 +204,14 @@ class CollisionChecker:
                                           position, orientation)
 
     def _attached_hits(self) -> Dict[int, List[int]]:
-        """Bodies the held object touches, at the current configuration."""
+        """Bodies the held object touches, at the current configuration.
+
+        getClosestPoints(blockId, robotId, ...) reports linkIndexA for the
+        block and linkIndexB for the robot. Reading field 3 gives the
+        block's own link, which is -1 for a single body, so every grasp
+        contact looked like a fault on a disallowed link. The robot's link
+        is field 4.
+        """
         if self.attached is None:
             return {}
         self._place_attached()
@@ -217,10 +224,10 @@ class CollisionChecker:
                 hits[body] = [-1]
 
         touching_robot = [
-            contact[3]
+            contact[4]
             for contact in p.getClosestPoints(self.attached.body, self.robot,
                                               self.margin)
-            if contact[3] not in self.attached.allowed_links
+            if contact[4] not in self.attached.allowed_links
         ]
         if touching_robot:
             hits[self.robot] = sorted(set(touching_robot))

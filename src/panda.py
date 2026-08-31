@@ -25,8 +25,17 @@ FINGER_JOINTS = [9, 10]
 # Frame between the fingertips, which is what a grasp pose refers to.
 END_EFFECTOR_LINK = 11
 
+# Finger travel limits, per finger. FINGER_CLOSED is the mechanical stop,
+# not a grasp command: a position controlled gripper does not stop on
+# contact, so closing to it drives the fingers straight through whatever
+# they are holding. Measured on a 40 mm block, closing to zero put the
+# fingers 21 mm inside it. Use grip_width_for() to close on an object.
 FINGER_OPEN = 0.04
 FINGER_CLOSED = 0.0
+
+# Finger pad thickness. Measured: the fingers meet a 40 mm block's surface
+# at a commanded width of 0.021 rather than 0.020.
+FINGER_PAD = 0.001
 
 # A comfortable arm pose, away from joint limits and self collision.
 HOME_CONFIGURATION = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
@@ -35,6 +44,15 @@ HOME_CONFIGURATION = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
 IK_TOLERANCE = 0.005
 
 Configuration = Sequence[float]
+
+
+def grip_width_for(object_half_width: float) -> float:
+    """Finger width that closes on an object without penetrating it.
+
+    A real gripper stops when it makes contact. This one is commanded to a
+    position, so the position has to account for the object.
+    """
+    return min(FINGER_OPEN, object_half_width + FINGER_PAD)
 
 
 @dataclass(frozen=True)
@@ -171,7 +189,6 @@ class Panda:
         restPoses. PyBullet's null space arguments were measured to be both
         silently ignored when their length does not match the number of
         movable joints, and roughly twenty times less accurate when it does.
-        See examples/debug_ik.py for that experiment.
 
         Because the solver returns angles for unreachable targets rather than
         failing, the answer is verified with forward kinematics and against

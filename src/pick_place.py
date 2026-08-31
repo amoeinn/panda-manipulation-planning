@@ -16,24 +16,23 @@ looking at the block. The checker now attaches the block instead: it stops
 being an obstacle and starts being a moving body whose swept volume is
 checked against the world at every configuration.
 
-What counts as a fault changes by phase. Descending to set the block down
-means touching the surface it lands on, which would be a collision during
-the transfer and is the purpose of the placement, so that contact is
-allowed explicitly for the phases where it is intended.
+What counts as a fault varies by phase, so intended contact is expressed as
+allowances on the attached object rather than by skipping the check.
+The gripper touches the block throughout the grasp, and setting the block
+down means touching the surface below it, but anything else touching it is
+still caught.
 
-The standoff height is computed in world coordinates. A held block hangs
-about a grasp height below the gripper, so for its underside to clear the
-wall the gripper must reach the wall top plus that grasp height plus a
-margin. Working in offsets relative to landmarks instead invites mixing
-datums: an earlier version measured the wall from the table surface and the
-standoff from the landmark 30 mm above it, and produced a target beyond the
-arm's usable reach.
+Heights are computed in world coordinates and were settled by measurement
+rather than derivation. Working in offsets relative to landmarks invites
+mixing datums: an earlier version measured the wall from the table surface
+and the standoff from a landmark 30 mm above it, and produced a target past
+the arm's usable reach.
 
 The phases:
 
   approach   move above the block, gripper open
   descend    straight down to the grasp pose
-  grasp      close the fingers, attach the block to the gripper
+  grasp      close the fingers on the block, attach it to the gripper
   lift       straight up, clear of the table
   transfer   plan over the wall to above the place location
   place      straight down to the release pose
@@ -47,7 +46,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 import pybullet as p
 
-from .panda import FINGER_CLOSED, FINGER_OPEN, Panda, Pose
+from .panda import FINGER_OPEN, Panda, Pose, grip_width_for
 
 Configuration = List[float]
 Transform = Tuple[Tuple[float, float, float],
@@ -124,7 +123,9 @@ class PickPlace:
                  plan: Callable[[Configuration, Configuration],
                                 Optional[List[Configuration]]],
                  standoff_z: Optional[float] = None,
-                 grasp_height: float = 0.055,
+                 grasp_height: float = -0.010,
+                 release_height: float = -0.005,
+                 block_half_width: float = 0.02,
                  wall_margin: float = 0.055):
         """
         Args:
@@ -137,8 +138,24 @@ class PickPlace:
                 transfer. Derived from the wall when not given, since a
                 standoff below the wall makes the transfer impossible for a
                 carried block no matter how well it is planned.
-            grasp_height: metres above the landmark for the grasp pose. Also
-                how far the block hangs below the gripper once held.
+            grasp_height: metres from the block centre to the grasp target
+                frame, negative because the frame sits about 11 mm above the
+                fingertips and the fingers have to reach down the side of
+                the block. At -0.010 the fingertips sit 41 mm below the
+                block top, enclosing its full height. At +0.02 they spanned
+                only the top 28 percent, which is a pinch on the upper edge
+                rather than a grasp.
+            release_height: metres from the place landmark to the grasp
+                target frame when setting the block down. Higher than the
+                grasp height because picking needs the fingers low around
+                the block, which holds them clear of the table, while
+                releasing leaves them reaching into the surface once the
+                block is gone. At the grasp height the fingertips sit
+                1.3 mm below the table surface.
+            block_half_width: half the block's width, used to work out how
+                far to close the fingers. Closing to the mechanical stop
+                drives them 21 mm into a 40 mm block, because nothing stops
+                a position commanded gripper on contact.
             wall_margin: extra clearance above the wall top, in metres.
         """
         self.panda = panda
@@ -146,13 +163,15 @@ class PickPlace:
         self.scene = scene
         self.plan = plan
         self.grasp_height = grasp_height
+        self.release_height = release_height
+        self.grip_width = grip_width_for(block_half_width)
 
         # The divided table scene lists table, wall, block, place marker.
         self.table, self.wall, self.block, self.marker = scene.bodies
 
         if standoff_z is None:
             wall_top = scene.landmarks["wall_top"][2]
-            standoff_z = wall_top + grasp_height + wall_margin
+            standoff_z = wall_top + abs(grasp_height) + wall_margin
         self.standoff_z = standoff_z
 
     def _pose_at(self, landmark: str, world_z: float) -> Pose:
@@ -162,7 +181,13 @@ class PickPlace:
         return Pose(position=(x, y, world_z), orientation=home.orientation)
 
     def _grasp_z(self, landmark: str) -> float:
-        return self.scene.landmarks[landmark][2] + self.grasp_height
+        """World height of the grasp target frame at a landmark.
+
+        Pick and place use different offsets: see release_height.
+        """
+        offset = (self.grasp_height if landmark == "pick"
+                  else self.release_height)
+        return self.scene.landmarks[landmark][2] + offset
 
     def _solve(self, landmark: str, world_z: float,
                seed: Optional[Configuration] = None
@@ -215,14 +240,15 @@ class PickPlace:
                                    gripper=FINGER_OPEN, planner="straight line"))
 
         self.panda.set_configuration(pick_at)
-        self.panda.set_gripper(FINGER_CLOSED)
+        self.panda.set_gripper(self.grip_width)
         self.checker.attach(self.block)
         result.grasp_relative = self.checker.attached.relative
-        result.phases.append(Phase("grasp", [pick_at], gripper=FINGER_CLOSED,
+        result.phases.append(Phase("grasp", [pick_at],
+                                   gripper=self.grip_width,
                                    attached=True, planner="gripper only"))
 
         result.phases.append(Phase("lift", straight_line(pick_at, pick_above),
-                                   gripper=FINGER_CLOSED, attached=True,
+                                   gripper=self.grip_width, attached=True,
                                    planner="straight line"))
 
         place_above, error = self._solve("place", self.standoff_z,
@@ -234,7 +260,7 @@ class PickPlace:
         if transfer is None:
             return fail("transfer", "no path over the wall carrying the block")
         result.phases.append(Phase("transfer", transfer,
-                                   gripper=FINGER_CLOSED, attached=True,
+                                   gripper=self.grip_width, attached=True,
                                    planner="planned"))
 
         # Setting the block down means touching what it lands on. The place
@@ -247,7 +273,7 @@ class PickPlace:
             return fail("place", error)
         result.phases.append(Phase("place",
                                    straight_line(place_above, place_at),
-                                   gripper=FINGER_CLOSED, attached=True,
+                                   gripper=self.grip_width, attached=True,
                                    planner="straight line"))
 
         self.panda.set_configuration(place_at)
