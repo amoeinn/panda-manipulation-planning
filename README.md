@@ -24,14 +24,14 @@ Five seeds on the transfer query, all twenty trajectories verified collision-fre
 
 | method | path length (rad) | roughness | interior clearance |
 | --- | --- | --- | --- |
-| RRT-Connect | 2.34 | 0.0248 | 21.0 mm |
-| shortcut | 1.67 | 0.0053 | 12.1 mm |
-| optimized | 2.12 | 0.0071 | 48.7 mm |
-| shortcut + optimized | 1.71 | 0.0039 | 46.8 mm |
+| RRT-Connect | 2.59 | 0.0319 | 16.5 mm |
+| shortcut | 1.78 | 0.0071 | 11.7 mm |
+| optimized | 2.26 | 0.0079 | 46.7 mm |
+| shortcut + optimized | 1.81 | 0.0042 | 36.6 mm |
 
-Shortcutting halves the roughness and shortens the path by 29 percent, and makes clearance worse: it splices straight lines with no notion of margin, so a shortcut passing a millimetre from the wall is accepted as readily as one with room to spare.
+Shortcutting cuts roughness by more than three quarters and shortens the path by 31 percent, and makes clearance worse: it splices straight lines with no notion of margin, so a shortcut passing a millimetre from the wall is accepted as readily as one with room to spare.
 
-Optimization nearly quadruples clearance for almost no length back. Running both keeps most of each.
+Optimization more than triples clearance over shortcutting alone, for two percent more path. Running both keeps most of each.
 
 Clearance is measured away from the endpoints. The start and goal are fixed IK solutions no method may move, so a whole-path minimum is bounded by whatever clearance they happen to have and reads identically for every method: an earlier version of this table reported the start configuration's clearance as though it were a result.
 

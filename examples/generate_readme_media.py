@@ -28,7 +28,7 @@ from PIL import Image
 
 from src.collision import CollisionChecker
 from src.optimizer import TrajectoryOptimizer, resample
-from src.panda import HOME_CONFIGURATION, Panda
+from src.panda import FINGER_OPEN, HOME_CONFIGURATION, Panda
 from src.pick_place import PickPlace, place_held_body
 from src.rrt_connect import RRTConnect
 from src.scene import build
@@ -204,7 +204,6 @@ def main() -> None:
     panda = Panda(gui=False)
     scene = build("divided")
     checker = CollisionChecker(panda, obstacles=scene.bodies)
-    oracle = SignedDistanceOracle(panda, checker)
     optimizer = TrajectoryOptimizer(model, panda.lower_limits,
                                     panda.upper_limits)
 
@@ -226,8 +225,22 @@ def main() -> None:
     gif = make_gif(panda, result)
     print(f"  {gif} ({gif.stat().st_size / 1e6:.1f} MB)")
 
+    # A fresh checker: the pick and place sequence removes the block from
+    # the obstacle list when it grasps and does not restore it, so reusing
+    # that checker would plan the comparison in a world with no block in it.
+    # The sequence leaves the world changed: the block ends at the place
+    # location and is no longer in the obstacle list. Both have to be undone
+    # before measuring, or the comparison plans around a block that has
+    # already been moved and reports longer paths than the same query does
+    # from a clean start.
     print("building the comparison figure")
-    figure = make_comparison(panda, checker, oracle, optimizer, scene)
+    pb.resetBasePositionAndOrientation(result.block, *result.block_start)
+    panda.set_configuration(HOME_CONFIGURATION)
+    panda.set_gripper(FINGER_OPEN)
+    comparison_checker = CollisionChecker(panda, obstacles=scene.bodies)
+    oracle = SignedDistanceOracle(panda, comparison_checker)
+    figure = make_comparison(panda, comparison_checker, oracle, optimizer,
+                             scene)
     print(f"  {figure} ({figure.stat().st_size / 1e3:.0f} KB)")
 
     panda.disconnect()
