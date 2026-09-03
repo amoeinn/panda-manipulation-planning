@@ -183,4 +183,4 @@ tests/
 
 MIT, see [LICENSE](LICENSE).
 
-This covers the code in this repository. The Franka Panda URDF and meshes are Franka Emika's, redistributed with PyBullet under their own terms.
+This covers the code in this repository. The Franka Panda model is not included here: it is loaded at runtime from the data that ships with PyBullet, and the kinematics and collision geometry that every planning and clearance result depends on are Franka Emika's, under their own terms. The ground plane comes from the same PyBullet sample data; the obstacles are box primitives built in code. The trained field in data/ was fit to clearance values computed from that geometry.
